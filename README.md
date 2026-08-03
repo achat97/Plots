@@ -4,8 +4,9 @@ Detects, classifies, and localizes active-sonar pulses (CW / LFM / HFM, both swe
 in ocean noise. A CNN–LSTM encoder-decoder reads a 5 s spectrogram and emits a list of pulses,
 each as (type, t_start, t_stop, f1, f2).
 
-The pipeline has 9 steps. Steps 1–4 build the data, 5 finds hyperparameters, 6–7 train and
-evaluate, 8 analyzes behavior, 9 runs on real recordings.
+The pipeline has 10 steps. Steps 1–4 build the data, 5 finds hyperparameters, 6–7 train and
+evaluate, 8 analyzes behavior, 9 runs on real recordings, and 10 measures the detected pulses
+precisely.
 
 ---
 
@@ -263,6 +264,60 @@ Each detection carries `confidence_det` = 1 − P(EOS) ("something is there") an
 
 ---
 
+## Step 10 — Refine the detected pulses  (`refine_detections.py`)
+
+**What it does:** measures each detected pulse directly in the spectrogram, at full frequency
+resolution. The network localises a pulse but estimates its frequencies from a feature map whose
+frequency axis has been halved in every CNN block, so its band carries an error of a few hundred
+Hz. Once the time span is known, the ~24 Hz STFT bins can be used directly: the script tracks the
+ridge of peak energy through the pulse, fits the linear (LFM) and hyperbolic (HFM) sweep laws, and
+reports whichever fits better.
+
+```bash
+python refine_detections.py --wav recording.wav --detections recording_detections.csv --plot
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--wav / --detections` | — | the recording and the CSV from step 9 (both required) |
+| `--out` | `<detections>_refined.csv` | output CSV |
+| `--context` | 0.5 | seconds of signal kept on each side of a pulse |
+| `--pad-hz` | 1500 | width added to each side of the predicted band when searching |
+| `--snr-db` | *auto* | ridge threshold above the median level of a time bin — by default chosen per pulse from 4/6/8/12/16 dB |
+| `--rel-db` | *auto* | level range kept below the strongest column — by default chosen per pulse from 12/20/30 dB |
+| `--min-points` | 8 | fewest ridge points accepted for a refinement |
+| `--max-rmse-bins` | 3.0 | largest accepted fit residual, in frequency bins |
+| `--min-margin` | 0.1 | smallest residual gap between the two sweep laws for the LFM/HFM distinction to be trusted; below this the type is reported as `swept` |
+| `--plot / --max-plots / --outdir` | off / 20 / `refined` | overview of all refinements plus a spectrogram per pulse |
+
+**Thresholds tune themselves.** A faint pulse needs a permissive ridge threshold to yield any
+track at all; a loud pulse beside an interfering tone needs a strict one. No single setting suits
+both, so the script tries several per pulse and keeps the one whose sweep fit has the lowest
+residual — an internal quality measure that needs no labels. Costs about 0.1 s per pulse. Pass
+`--snr-db` or `--rel-db` explicitly to fix either one.
+
+**What it gives you** (added as columns beside the network's own, which are never overwritten):
+
+- `refined_f1_hz`, `refined_f2_hz` with `refined_f1_se_hz`, `refined_f2_se_hz` — the ± to quote
+- `refined_direction` — up, down or flat, from the sign of the fitted slope. The network gets this
+  wrong whenever the sweep is narrower than its own frequency error, since the direction is then
+  the sign of a difference smaller than the noise on either endpoint
+- `refined_type` — LFM, HFM or CW from the fit; `swept` when the two laws fit equally well
+- `refined_bandwidth_hz`, `refined_slope_hz_per_s`, `refined_rmse_hz`, `refined_n_points`
+- `refined_snr_db`, `refined_rel_db` — the thresholds chosen for that pulse
+- `refined` = 0 with a reason in `refined_note` when the ridge was too short or too scattered to
+  fit; those pulses keep the network's values
+
+**CW pulses get one frequency.** A constant tone has a single centre frequency, but the decoder's
+four regression heads are independent, so the network can report two endpoints hundreds of Hz
+apart for a CW detection. The fit constrains them to one tone: both endpoints are set to the mean,
+and the standard error of that mean is reported.
+
+**It never adds or removes detections** — recall, false alarms and the operating threshold are all
+decided in steps 8 and 9. This step only measures what was already found.
+
+---
+
 **Figures.** All plotting shares `plot_style.py`: one colour per pulse type (CW/LFM/HFM), sentence-case labels with units in brackets, linear axes for rates and counts, and every reference line carrying a legend entry. Change fonts or colours there once and every figure follows.
 
 ## Background — the concepts the pipeline leans on
@@ -289,6 +344,13 @@ nearly invisible, so **AR values from before this change are not comparable**. U
 checkpoint selection, tuning, reruns, and ablations alike; teacher-forced losses are logged next
 to it so the correlation can be checked.
 
+**Two stages.** The network finds pulses and localises them in time; the refinement stage measures
+their frequencies. This split is deliberate: learning handles what it is good at (finding events
+in noise, handling a variable number of them), and classical estimation handles what it is good at
+(measuring parameters precisely once the signal is known to be there). Established passive-acoustic
+software is built the same way, with an energy detector feeding a contour stage; here a learned
+detector replaces the energy detector.
+
 **Constants** (`data_config.py`): `FS` 50000 · `FREQ_MAX` 25000 · `TIME_MAX` 5.0 ·
 `PULSE_F_MIN/MAX` 1000/24990 · `PULSE_BW_MIN/MAX` 100/4000 · `SNR_MIN/MAX` −15/40 ·
 `PATCH_DELTA_MIN/MAX` 15/30 · `NPERSEG/NOVERLAP` 2048/1024 (Δf ≈ 24.4 Hz, Δt ≈ 20.5 ms).
@@ -300,7 +362,7 @@ to it so the correlation can be checked.
 Segment-disjoint split (#2) · downward sweeps (#7) · pulse-coupled source-noise patch (#3-mod) ·
 `false_alarm_sweep.py` (#6) · reweighted AR score (configurable `ar_weights` + tightened MAE
 scales; old AR values not comparable) · per-epoch validation component log (`val_components.csv`)
-· memory-safe detection plotting. Earlier revision: post-injection normalization, AR-score selection,
+· memory-safe detection plotting · contour refinement of detected pulses (`refine_detections.py`, with per-pulse threshold selection and single-frequency CW reporting) · consistent figure style across all scripts (`plot_style.py`). Earlier revision: post-injection normalization, AR-score selection,
 frequency-gated matching/merging, SNR U(−15,40), seeded generation, val split, test-only
 analyses, dual detection confidences, upsampling guard. **Old datasets and checkpoints are not
 comparable — regenerate and retrain.**
